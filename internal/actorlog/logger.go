@@ -35,6 +35,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"go.opentelemetry.io/otel/trace"
 
@@ -118,67 +119,117 @@ func (al *ActorLogger) StartJSONLogPipe(a resources.ActorAttribution, containerN
 	return pw, nil
 }
 
+// maxLineBytes caps the size of a container log line. WrapContainerLogs splits a
+// longer line into plain-text records of at most this size, so an actor writing
+// no newline cannot grow the worker's heap without bound. The records also stay
+// well under the 1 MiB line limit of `kubectl ate logs`.
+const maxLineBytes = 64 << 10
+
 // WrapContainerLogs reads log lines from r, parses them, and logs them in a unified
 // structured format. containerName is added as the ate.actor.container.name label
-// so multi-container actors can be demultiplexed.
+// so multi-container actors can be demultiplexed. Lines longer than maxLineBytes
+// are split and forwarded as plain text.
 func (al *ActorLogger) WrapContainerLogs(r io.Reader, a resources.ActorAttribution, containerName string) {
-	rdr := bufio.NewReader(r)
+	// One extra byte holds the newline of a line of exactly maxLineBytes.
+	rdr := bufio.NewReaderSize(r, maxLineBytes+1)
+	var carry []byte // the rest of a long line after its last full piece
+	split := false   // the line in progress is longer than maxLineBytes
 	for {
-		lineBytes, err := rdr.ReadBytes('\n')
+		lineBytes, err := rdr.ReadSlice('\n')
+		full := errors.Is(err, bufio.ErrBufferFull)
+		if len(carry) > 0 {
+			lineBytes = append(carry, lineBytes...)
+			carry = nil
+		}
 
-		// Strip trailing newline from ReadBytes if present
+		// Strip trailing newline from ReadSlice if present
 		if len(lineBytes) > 0 && lineBytes[len(lineBytes)-1] == '\n' {
 			lineBytes = lineBytes[:len(lineBytes)-1]
 		}
 
-		if len(lineBytes) > 0 {
-			var m map[string]any
-			var envelope map[string]any
-
-			dec := json.NewDecoder(bytes.NewReader(lineBytes))
-			dec.UseNumber()
-
-			unmarshalErr := dec.Decode(&m)
-			if unmarshalErr == nil && m == nil {
-				unmarshalErr = errors.New("JSON value is not an object")
-			}
-			if unmarshalErr == nil {
-				var trailing any
-				if err := dec.Decode(&trailing); err != io.EOF {
-					unmarshalErr = errors.New("trailing garbage detected after JSON object")
-				}
-			}
-
-			if unmarshalErr != nil {
-				envelope = map[string]any{
-					"time":       time.Now().Format(time.RFC3339Nano),
-					"message":    string(lineBytes),
-					al.labelsKey: ateattr.ActorLogLabels(a, containerName),
-				}
-			} else {
-				if _, ok := m["time"]; !ok {
-					m["time"] = time.Now().Format(time.RFC3339Nano)
-				}
-				for k := range m {
-					if strings.HasPrefix(k, ateattr.ReservedNamespace) {
-						delete(m, k)
-					}
-				}
-				labels := al.foldLabelGroups(m)
-				for k, v := range ateattr.ActorLogLabels(a, containerName) {
-					labels[k] = v
-				}
-				m[al.labelsKey] = labels
-				envelope = m
-			}
-
-			al.write(envelope)
+		for len(lineBytes) > maxLineBytes {
+			cut := utf8Boundary(lineBytes[:maxLineBytes])
+			al.writeLine(lineBytes[:cut], a, containerName, true)
+			lineBytes = lineBytes[cut:]
+			split = true
 		}
+		if full {
+			// The line goes on. Keep the rest for the next piece.
+			carry = bytes.Clone(lineBytes)
+			continue
+		}
+		al.writeLine(lineBytes, a, containerName, split)
+		split = false
 
 		if err != nil {
 			break
 		}
 	}
+}
+
+// utf8Boundary returns the length of the longest prefix of b that does not end
+// inside a multi-byte UTF-8 sequence, so a split does not corrupt a character.
+// Bytes that are not valid UTF-8 anyway stay where they are.
+func utf8Boundary(b []byte) int {
+	for i := len(b) - 1; i >= 0 && i > len(b)-utf8.UTFMax; i-- {
+		if utf8.RuneStart(b[i]) {
+			if !utf8.FullRune(b[i:]) {
+				return i
+			}
+			break
+		}
+	}
+	return len(b)
+}
+
+// writeLine logs one line without its newline. A JSON object line keeps its
+// fields. Anything else, and every piece of a split line, goes under "message".
+func (al *ActorLogger) writeLine(lineBytes []byte, a resources.ActorAttribution, containerName string, plain bool) {
+	if len(lineBytes) == 0 {
+		return
+	}
+	var m map[string]any
+	if !plain {
+		m = parseJSONObject(lineBytes)
+	}
+	if m == nil {
+		al.write(map[string]any{
+			"time":       time.Now().Format(time.RFC3339Nano),
+			"message":    string(lineBytes),
+			al.labelsKey: ateattr.ActorLogLabels(a, containerName),
+		})
+		return
+	}
+	if _, ok := m["time"]; !ok {
+		m["time"] = time.Now().Format(time.RFC3339Nano)
+	}
+	for k := range m {
+		if strings.HasPrefix(k, ateattr.ReservedNamespace) {
+			delete(m, k)
+		}
+	}
+	labels := al.foldLabelGroups(m)
+	for k, v := range ateattr.ActorLogLabels(a, containerName) {
+		labels[k] = v
+	}
+	m[al.labelsKey] = labels
+	al.write(m)
+}
+
+// parseJSONObject returns the line's fields if it holds exactly one JSON
+// object, and nil otherwise.
+func parseJSONObject(line []byte) map[string]any {
+	dec := json.NewDecoder(bytes.NewReader(line))
+	dec.UseNumber()
+	var m map[string]any
+	if err := dec.Decode(&m); err != nil {
+		return nil
+	}
+	var trailing any
+	if err := dec.Decode(&trailing); err != io.EOF {
+		return nil
+	}
+	return m
 }
 
 func (al *ActorLogger) write(envelope map[string]any) {

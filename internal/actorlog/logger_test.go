@@ -341,6 +341,87 @@ func TestWrapContainerLogs_TrailingGarbage(t *testing.T) {
 	assertLabels(t, labelGroup(t, al, m), identityLabels())
 }
 
+// TestWrapContainerLogs_LongLines covers lines longer than maxLineBytes, down to
+// a stream with no newline at all: they come out as plain-text records no longer
+// than maxLineBytes that join back into the input.
+func TestWrapContainerLogs_LongLines(t *testing.T) {
+	long := strings.Repeat("a", 3*maxLineBytes+10)
+	longJSON := `{"msg":"` + strings.Repeat("b", maxLineBytes) + `"}`
+	exact := `{"msg":"` + strings.Repeat("c", maxLineBytes-len(`{"msg":""}`)) + `"}`
+	// The three-byte euro sign straddles the first split point.
+	euro := strings.Repeat("d", maxLineBytes-1) + "€" + "tail"
+
+	tests := []struct {
+		name  string
+		input string
+		want  []string // the message of each record, or its msg field for JSON
+		json  []bool   // which records keep their JSON fields
+	}{
+		{
+			name:  "no newline",
+			input: long,
+			want:  []string{long[:maxLineBytes], long[maxLineBytes : 2*maxLineBytes], long[2*maxLineBytes : 3*maxLineBytes], long[3*maxLineBytes:]},
+			json:  []bool{false, false, false, false},
+		},
+		{
+			name:  "long JSON line then short JSON line",
+			input: longJSON + "\n" + `{"msg":"next"}` + "\n",
+			want:  []string{longJSON[:maxLineBytes], longJSON[maxLineBytes:], "next"},
+			json:  []bool{false, false, true},
+		},
+		{
+			name:  "JSON line of exactly maxLineBytes",
+			input: exact + "\n",
+			want:  []string{strings.Repeat("c", maxLineBytes-len(`{"msg":""}`))},
+			json:  []bool{true},
+		},
+		{
+			name:  "split keeps multi-byte characters whole",
+			input: euro + "\n",
+			want:  []string{euro[:maxLineBytes-1], euro[maxLineBytes-1:]},
+			json:  []bool{false, false},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			al := NewActorLogger(&buf, false)
+			al.WrapContainerLogs(strings.NewReader(tc.input), testAttribution, testContainer)
+
+			dec := json.NewDecoder(&buf)
+			var got []string
+			var gotJSON []bool
+			for {
+				var m map[string]any
+				if err := dec.Decode(&m); err != nil {
+					break
+				}
+				msg, isJSON := m["msg"].(string)
+				if !isJSON {
+					msg, _ = m["message"].(string)
+				}
+				if len(msg) > maxLineBytes {
+					t.Errorf("record %d message is %d bytes, want at most %d", len(got), len(msg), maxLineBytes)
+				}
+				assertLabels(t, labelGroup(t, al, m), identityLabels())
+				got = append(got, msg)
+				gotJSON = append(gotJSON, isJSON)
+			}
+			if len(got) != len(tc.want) {
+				t.Fatalf("got %d records, want %d", len(got), len(tc.want))
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Errorf("record %d message differs from want (len %d, want len %d)", i, len(got[i]), len(tc.want[i]))
+				}
+				if gotJSON[i] != tc.json[i] {
+					t.Errorf("record %d kept JSON fields = %t, want %t", i, gotJSON[i], tc.json[i])
+				}
+			}
+		})
+	}
+}
+
 func TestEmitLifecycleLog(t *testing.T) {
 	const (
 		traceID = "4bf92f3577b34da6a3ce929d0e0e4736"
