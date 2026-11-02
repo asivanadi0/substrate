@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"go.ate.dev/substrate/api/ateapi/v1"
+	"go.ate.dev/substrate/internal/protoredact"
 	"go.ate.dev/substrate/internal/resources"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
@@ -135,6 +136,68 @@ func TestLoggingUnaryInterceptor(t *testing.T) {
 			t.Errorf("vTrace stderr = %q, want request and response payloads", got)
 		}
 	})
+}
+
+func TestLoggingUnaryInterceptorRedactsSecrets(t *testing.T) {
+	setVerbosity(t, vTrace)
+	const secret = "canary-secret-value"
+	tmpl := &ateapi.ActorTemplate{
+		Metadata: &ateapi.ResourceMetadata{Atespace: "demo", Name: "tmpl-1"},
+		Containers: []*ateapi.Container{{
+			Name: "main",
+			Env:  []*ateapi.EnvVar{{Name: "API_KEY", Value: secret}},
+		}},
+	}
+
+	tests := []struct {
+		name   string
+		method string
+		req    proto.Message
+		reply  proto.Message
+		want   proto.Message
+	}{
+		{
+			name:   "env value in request and response",
+			method: ateapi.Control_CreateActorTemplate_FullMethodName,
+			req:    &ateapi.CreateActorTemplateRequest{ActorTemplate: tmpl},
+			reply:  &ateapi.ActorTemplate{},
+			want:   tmpl,
+		},
+		{
+			name:   "actor JWT in response",
+			method: ateapi.Control_MintActorJwt_FullMethodName,
+			req:    &ateapi.MintActorJwtRequest{Actor: &ateapi.ObjectRef{Atespace: "demo", Name: "act-1"}},
+			reply:  &ateapi.MintActorJwtResponse{},
+			want:   &ateapi.MintActorJwtResponse{ActorJwt: secret},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			invoker := func(_ context.Context, _ string, _, reply any, _ *grpc.ClientConn, _ ...grpc.CallOption) error {
+				proto.Merge(reply.(proto.Message), tc.want)
+				return nil
+			}
+			reqBefore := proto.Clone(tc.req)
+			var errOut bytes.Buffer
+			ic := newLoggingUnaryInterceptor(&errOut)
+			if err := ic(context.Background(), tc.method, tc.req, tc.reply, nil, invoker); err != nil {
+				t.Fatalf("interceptor unexpected error: %v", err)
+			}
+			got := errOut.String()
+			if strings.Contains(got, secret) {
+				t.Errorf("vTrace stderr = %q, want %q masked", got, secret)
+			}
+			if !strings.Contains(got, protoredact.Placeholder) {
+				t.Errorf("vTrace stderr = %q, want %q", got, protoredact.Placeholder)
+			}
+			if !proto.Equal(tc.req, reqBefore) {
+				t.Errorf("request changed to %v, want %v", tc.req, reqBefore)
+			}
+			if !proto.Equal(tc.reply, tc.want) {
+				t.Errorf("reply = %v, want %v", tc.reply, tc.want)
+			}
+		})
+	}
 }
 
 func TestLogsActorRunner_FollowVerboseSurfacesDelaysAndErrors(t *testing.T) {
